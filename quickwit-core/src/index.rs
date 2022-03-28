@@ -65,7 +65,6 @@ impl IndexService {
             default_index_root_uri,
         }
     }
-
     /// Get an index from `index_id`.
     pub async fn get_index(&self, index_id: &str) -> Result<IndexMetadata, IndexServiceError> {
         let index_metadata = self.metastore.index_metadata(index_id).await?;
