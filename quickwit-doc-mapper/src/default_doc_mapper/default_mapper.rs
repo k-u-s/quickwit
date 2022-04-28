@@ -17,7 +17,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context};
 use quickwit_proto::SearchRequest;
@@ -406,6 +406,30 @@ impl std::fmt::Debug for DefaultDocMapper {
     }
 }
 
+/// Given a named doc as returned by the leaf servers,
+/// this function extracts its dynamic values.
+fn extract_dynamic_vals(
+    doc: &mut BTreeMap<String, Vec<JsonValue>>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut dynamic_vals = if let Some(dynamic_vals) = doc.remove(DYNAMIC_FIELD_NAME) {
+        dynamic_vals
+    } else {
+        return Ok(Default::default());
+    };
+    if dynamic_vals.len() > 1 {
+        bail!(
+            "Invalid named document. There are more than 1 value associated to the dynamic field."
+        );
+    }
+    match dynamic_vals.pop() {
+        Some(JsonValue::Object(dynamic_json_obj)) => Ok(dynamic_json_obj),
+        Some(_) => {
+            bail!("The dynamic value has to be a json object.");
+        }
+        None => Ok(Default::default()),
+    }
+}
+
 #[typetag::serde(name = "default")]
 impl DocMapper for DefaultDocMapper {
     fn doc_from_json(&self, doc_json: String) -> Result<Document, DocParsingError> {
@@ -439,6 +463,17 @@ impl DocMapper for DefaultDocMapper {
 
         self.check_missing_required_fields(&document)?;
         Ok(document)
+    }
+
+    fn doc_to_json(
+        &self,
+        mut named_doc: BTreeMap<String, Vec<serde_json::Value>>,
+    ) -> anyhow::Result<serde_json::Map<String, JsonValue>> {
+        let mut doc_json = extract_dynamic_vals(&mut named_doc)?;
+        let mut field_path: Vec<&str> = Vec::new();
+        self.field_mappings
+            .populate_json(&mut named_doc, &mut field_path, &mut doc_json);
+        Ok(doc_json)
     }
 
     fn query(

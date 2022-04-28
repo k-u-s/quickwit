@@ -17,11 +17,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 use dyn_clone::{clone_trait_object, DynClone};
 use quickwit_proto::SearchRequest;
+use serde_json::Value as JsonValue;
 use tantivy::query::Query;
 use tantivy::schema::{Field, Schema};
 use tantivy::Document;
@@ -42,6 +43,11 @@ pub trait DocMapper: Send + Sync + Debug + DynClone + 'static {
     ///
     /// (we pass by value here, as the value can be used as is in the _source field.)
     fn doc_from_json(&self, doc_json: String) -> Result<Document, DocParsingError>;
+
+    fn doc_to_json(
+        &self,
+        named_doc: BTreeMap<String, Vec<JsonValue>>,
+    ) -> anyhow::Result<serde_json::Map<String, JsonValue>>;
 
     /// Returns the schema.
     ///

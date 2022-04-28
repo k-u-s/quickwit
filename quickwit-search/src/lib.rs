@@ -41,6 +41,7 @@ mod thread_pool;
 pub type Result<T> = std::result::Result<T, SearchError>;
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -49,9 +50,11 @@ use itertools::Itertools;
 use quickwit_cluster::Cluster;
 use quickwit_config::{build_doc_mapper, QuickwitConfig, SEARCHER_CONFIG_INSTANCE};
 use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
+use quickwit_doc_mapper::DocMapper;
 use quickwit_metastore::{Metastore, SplitMetadata, SplitState};
 use quickwit_proto::{PartialHit, SearchRequest, SearchResponse, SplitIdAndFooterOffsets};
 use quickwit_storage::StorageUriResolver;
+use serde_json::Value as JsonValue;
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::agg_result::AggregationResults;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -146,6 +149,35 @@ async fn list_relevant_splits(
         .collect::<Vec<_>>())
 }
 
+/// Converts a `LeafHit` into a `Hit`.
+///
+/// Splits may have been created with different DocMappers.
+/// For this reason, leaves are returning a document that is -as much
+/// as possible-, `DocMapper` agnostic.
+///
+/// As a result, all documents will have the actual same schema,
+/// hence facilitating the implementation on the consumer side.
+///
+/// For instance, if the cardinality of a field changed from single-valued
+/// to multivalued, we do want the documents emitted from old splits to
+/// also serialize the fields values as a JsonArray.
+///
+/// The `convert_leaf_hit` is critical and needs to be tested against
+/// allowed DocMapper changes.
+fn convert_leaf_hit(
+    leaf_hit: quickwit_proto::LeafHit,
+    doc_mapper: &dyn DocMapper,
+) -> crate::Result<quickwit_proto::Hit> {
+    let hit_json: BTreeMap<String, Vec<JsonValue>> = serde_json::from_str(&leaf_hit.leaf_json)
+        .map_err(|_| SearchError::InternalError(format!("Invalid leaf json.")))?;
+    let doc = doc_mapper.doc_to_json(hit_json)?;
+    let json = serde_json::to_string(&doc).expect("Json serialization should never fail.");
+    Ok(quickwit_proto::Hit {
+        json,
+        partial_hit: leaf_hit.partial_hit,
+    })
+}
+
 /// Performs a search on the current node.
 /// See also `[distributed_search]`.
 pub async fn single_node_search(
@@ -171,7 +203,7 @@ pub async fn single_node_search(
         search_request,
         index_storage.clone(),
         &split_metadata[..],
-        doc_mapper,
+        doc_mapper.clone(),
     )
     .await
     .context("Failed to perform leaf search.")?;
@@ -182,6 +214,11 @@ pub async fn single_node_search(
     )
     .await
     .context("Failed to perform fetch docs.")?;
+    let hits: Vec<quickwit_proto::Hit> = fetch_docs_response
+        .hits
+        .into_iter()
+        .map(|leaf_hit| crate::convert_leaf_hit(leaf_hit, &*doc_mapper))
+        .collect::<crate::Result<_>>()?;
     let elapsed = start_instant.elapsed();
     Ok(SearchResponse {
         aggregation: leaf_search_response
@@ -196,7 +233,7 @@ pub async fn single_node_search(
             .transpose()
             .map_err(|err| SearchError::InternalError(err.to_string()))?,
         num_hits: leaf_search_response.num_hits,
-        hits: fetch_docs_response.hits,
+        hits,
         elapsed_time_micros: elapsed.as_micros() as u64,
         errors: leaf_search_response
             .failed_splits
@@ -233,7 +270,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use assert_json_diff::assert_json_include;
+    use quickwit_doc_mapper::{DefaultDocMapperBuilder, DefaultDocMapper};
     use quickwit_indexing::TestSandbox;
+    use quickwit_proto::LeafHit;
     use serde_json::json;
 
     use super::*;
@@ -591,5 +630,34 @@ mod tests {
             assert_eq!(&docs[..], &[3u32]); // 1 is not matched due to the raw tokenizer
         }
         Ok(())
+    }
+
+    #[track_caller]
+    fn test_convert_leaf_hit_aux(
+        default_doc_mapper_json: serde_json::Value,
+        leaf_hit_json: serde_json::Value,
+        expected_hit_json: serde_json::Value
+    ) {
+        let default_doc_mapper: DefaultDocMapper = serde_json::from_value(default_doc_mapper_json).unwrap();
+        let hit= convert_leaf_hit(LeafHit {
+            leaf_json: serde_json::to_string(&leaf_hit_json).unwrap(),
+            partial_hit: Default::default(),
+        }, &default_doc_mapper).unwrap();
+        let hit_json: serde_json::Value = serde_json::from_str(&hit.json).unwrap();
+        assert_eq!(leaf_hit_json, hit_json);
+    }
+
+    #[test]
+    fn test_convert_leaf_hit_simple() {
+        test_convert_leaf_hit_aux(
+            json!({
+                "field_mappings": [
+                    { "name": "body", "type": "array<text>" }
+                ],
+                "mode": "lenient"
+            }),
+        json!({ "body": "hello" }),
+        json!({ "body": ["hello"] })
+        );
     }
 }
